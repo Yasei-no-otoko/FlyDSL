@@ -6,8 +6,9 @@
 RMSNorm(x) = x / sqrt(mean(x^2) + eps) * gamma
 
 Two paths:
-  - Fast path (N % tile_cols == 0): 128-bit buffer copies.
-  - Generic path (arbitrary N): scalar guarded copies.
+  - Fast path (16-bit dtypes, N >= tile_cols, N % 8 == 0): 128-bit buffer copies, with the partial last tile masked.
+    BF16 outputs on targets without v_cvt_pk_bf16_f32 take it for whole tiles only (N % tile_cols == 0).
+  - Generic path (other N): scalar guarded copies.
 """
 
 import math
@@ -45,6 +46,7 @@ from kernels.norm.rmsnorm_common import store_scalar as _store_scalar
 from kernels.norm.rmsnorm_common import store_vec as _store_vec
 from kernels.norm.rmsnorm_common import to_elem_scalar as _to_elem_scalar
 from kernels.norm.rmsnorm_common import to_elem_vec as _to_elem_vec
+from kernels.norm.rmsnorm_common import to_elem_vec_keeps_nan as _to_elem_vec_keeps_nan
 from kernels.norm.rmsnorm_common import weight_vec_width as _weight_vec_width
 
 try:
@@ -84,6 +86,7 @@ def build_rmsnorm_module(
 
     arch = get_rocm_arch()
     USE_HW_CVT_PK_BF16_F32 = _has_hw_cvt_pk_bf16_f32(arch)
+    VEC_PARTIAL_TILES = _to_elem_vec_keeps_nan(dtype_str, USE_HW_CVT_PK_BF16_F32)
 
     # BLOCK_THREADS controls storage, tiling, and launch geometry.
     tile_cols = BLOCK_THREADS * VEC_WIDTH
@@ -167,7 +170,7 @@ def build_rmsnorm_module(
         # Fast path for 128-bit tiles. When N is not a whole number of tiles (e.g. N = 7168, the DeepSeek-V3/Kimi
         # hidden size) the last tile is partial: lanes whose 8-element vector lies past the row end load from a
         # safe index, contribute nothing to the sum of squares, and skip their stores.
-        if const_expr(N >= tile_cols and N % VEC_WIDTH == 0 and elem_bits <= 16):
+        if const_expr(N >= tile_cols and N % (VEC_WIDTH if VEC_PARTIAL_TILES else tile_cols) == 0 and elem_bits <= 16):
             num_tiles = (N + tile_cols - 1) // tile_cols
             n_vecs = N // VEC_WIDTH
             Input_buf = fx.rocdl.make_buffer_tensor(Input)
@@ -370,13 +373,13 @@ def _build_rmsnorm_large_m_small_n_module(
     BLOCK_THREADS_SPECIAL = BLOCK_M * THREADS_PER_ROW
     elem_bits = 32 if dtype_str == "f32" else 16
     weight_elem_bits = 32 if weight_dtype_str == "f32" else 16
+    arch = get_rocm_arch()
+    USE_HW_CVT_PK_BF16_F32 = _has_hw_cvt_pk_bf16_f32(arch)
     # 128-bit path: each lane keeps its 8-element vectors of the row (and the matching gamma vectors) in registers,
     # so the second pass issues no global loads. The scalar loop re-reads x and gamma after every store, which
     # serializes one memory round trip per element (N = 1536: ~13 us per row regardless of M).
-    VEC_PATH = N % VEC_WIDTH == 0 and elem_bits <= 16
+    VEC_PATH = N % VEC_WIDTH == 0 and elem_bits <= 16 and _to_elem_vec_keeps_nan(dtype_str, USE_HW_CVT_PK_BF16_F32)
     n_vecs = N // VEC_WIDTH
-    arch = get_rocm_arch()
-    USE_HW_CVT_PK_BF16_F32 = _has_hw_cvt_pk_bf16_f32(arch)
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS_SPECIAL, 1, 1])
     def rmsnorm_large_m_small_n_kernel(
@@ -550,6 +553,7 @@ def build_fused_add_rmsnorm_module(
     weight_dtype_str = _resolve_rmsnorm_weight_dtype(dtype_str, weight_dtype_str)
     arch = get_rocm_arch()
     USE_HW_CVT_PK_BF16_F32 = _has_hw_cvt_pk_bf16_f32(arch)
+    VEC_PARTIAL_TILES = _to_elem_vec_keeps_nan(dtype_str, USE_HW_CVT_PK_BF16_F32)
 
     tile_cols = BLOCK_THREADS * VEC_WIDTH
     RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
@@ -631,7 +635,7 @@ def build_fused_add_rmsnorm_module(
             return fx.memref_load(s_red, 0), fx.memref_load(s_red2, 0)
 
         # Fast path for 128-bit tiles, with a masked partial last tile as in the plain RMSNorm kernel.
-        if const_expr(N >= tile_cols and N % VEC_WIDTH == 0 and elem_bits <= 16):
+        if const_expr(N >= tile_cols and N % (VEC_WIDTH if VEC_PARTIAL_TILES else tile_cols) == 0 and elem_bits <= 16):
             num_tiles = (N + tile_cols - 1) // tile_cols
             n_vecs = N // VEC_WIDTH
             Input_buf = fx.rocdl.make_buffer_tensor(Input)

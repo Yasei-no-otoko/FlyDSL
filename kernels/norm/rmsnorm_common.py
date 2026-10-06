@@ -107,6 +107,16 @@ def has_hw_cvt_pk_bf16_f32(arch) -> bool:
     return arch.startswith("gfx95") or arch == "gfx1250"
 
 
+def to_elem_vec_keeps_nan(dtype_str: str, use_hw_cvt_bf16: bool) -> bool:
+    """Whether to_elem_vec keeps every NaN when it converts to `dtype_str`.
+
+    Only the BF16 integer rounding (no v_cvt_pk_bf16_f32) loses NaNs, which the scalar paths keep. The builders take
+    the 128-bit path for partial tiles and small N only where this holds; elsewhere BF16 outputs use it for whole
+    tiles only, as before.
+    """
+    return dtype_str != "bf16" or use_hw_cvt_bf16
+
+
 def to_elem_vec(dtype_str: str, elem_dtype, use_hw_cvt_bf16: bool, y):
     if const_expr(dtype_str == "bf16"):
         if const_expr(use_hw_cvt_bf16):

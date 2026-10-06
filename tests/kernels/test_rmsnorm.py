@@ -1792,6 +1792,33 @@ def test_rmsnorm_vec8_contiguous_storage_offset(weight_dtype):
     torch.testing.assert_close(dweight.to(DTYPE_FP32), dweight_ref, rtol=1e-1, atol=1.0)
 
 
+_NAN_COLS = [17, 118, 219]
+
+
+def _bf16_nan_inputs(N, M=4):
+    """BF16 x and residual, and an FP32 weight with NaN payloads in the _NAN_COLS columns."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(0)
+    x = torch.randn((M, N), device=device, dtype=DTYPE_BF16)
+    residual = torch.randn((M, N), device=device, dtype=DTYPE_BF16)
+    weight = torch.rand((N,), device=device, dtype=DTYPE_FP32) + 0.5
+    # Payloads at or above 0x7FFF8000 (0xFFFFFFFF, 0x7FFFFFFF) round to +-0 under the integer rounding;
+    # 0x7FC00000 is the canonical NaN.
+    for col, bits in zip(_NAN_COLS, (-1, 0x7FFFFFFF, 0x7FC00000)):
+        weight.view(torch.int32)[col] = bits
+    return x, residual, weight
+
+
+def _assert_bf16_nan_output(out, source, weight):
+    assert torch.isnan(out[:, _NAN_COLS].to(DTYPE_FP32)).all()
+    finite_weight = weight.clone()
+    finite_weight[_NAN_COLS] = 1.0
+    keep = torch.ones(weight.numel(), dtype=torch.bool, device=out.device)
+    keep[_NAN_COLS] = False
+    ref = _reference_rmsnorm(source, finite_weight)
+    torch.testing.assert_close(out[:, keep].to(DTYPE_FP32), ref[:, keep], rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.skipif(
     not has_hw_cvt_pk_bf16_f32(GPU_ARCH),
     reason="the integer bf16 rounding used without v_cvt_pk_bf16_f32 does not keep NaN payloads",
@@ -1802,32 +1829,36 @@ def test_rmsnorm_vec8_contiguous_storage_offset(weight_dtype):
 )
 def test_rmsnorm_bf16_output_keeps_nan(N, fused_add):
     """NaN payloads in FP32 weights stay NaN in the BF16 output of the 128-bit paths."""
-    device = torch.device("cuda", torch.cuda.current_device())
-    M = 4
-    torch.manual_seed(0)
-    x = torch.randn((M, N), device=device, dtype=DTYPE_BF16)
-    residual = torch.randn((M, N), device=device, dtype=DTYPE_BF16)
-    weight = torch.rand((N,), device=device, dtype=DTYPE_FP32) + 0.5
-    nan_cols = [17, 118, 219]
-    # Payloads at or above 0x7FFF8000 (0xFFFFFFFF, 0x7FFFFFFF) round to +-0 under the integer rounding;
-    # 0x7FC00000 is the canonical NaN.
-    for col, bits in zip(nan_cols, (-1, 0x7FFFFFFF, 0x7FC00000)):
-        weight.view(torch.int32)[col] = bits
-
+    x, residual, weight = _bf16_nan_inputs(N)
     if fused_add:
         out, _ = fused_add_rmsnorm(x, residual, weight, prenorm=True)
         source = (x.to(DTYPE_FP32) + residual.to(DTYPE_FP32)).to(DTYPE_BF16)
     else:
         out = rmsnorm(x, weight)
         source = x
+    _assert_bf16_nan_output(out, source, weight)
 
-    assert torch.isnan(out[:, nan_cols].to(DTYPE_FP32)).all()
-    finite_weight = weight.clone()
-    finite_weight[nan_cols] = 1.0
-    keep = torch.ones(N, dtype=torch.bool, device=device)
-    keep[nan_cols] = False
-    ref = _reference_rmsnorm(source, finite_weight)
-    torch.testing.assert_close(out[:, keep].to(DTYPE_FP32), ref[:, keep], rtol=2e-2, atol=2e-2)
+
+@pytest.mark.parametrize("N, fused_add", [(1536, False), (2880, False), (7168, False), (2880, True), (7168, True)])
+def test_rmsnorm_bf16_output_keeps_nan_without_hw_cvt(N, fused_add, monkeypatch):
+    """Without v_cvt_pk_bf16_f32, small N and partial tiles keep the scalar BF16 conversion, which keeps NaNs."""
+    monkeypatch.setattr(rmsnorm_kernel_impl, "_has_hw_cvt_pk_bf16_f32", lambda arch: False)
+    x, residual, weight = _bf16_nan_inputs(N)
+    M = x.shape[0]
+    out = torch.empty_like(x)
+    stream = torch.cuda.current_stream()
+    # Build directly: the public wrappers cache launchers per shape, built without the patched predicate.
+    if fused_add:
+        launch = rmsnorm_kernel_impl.build_fused_add_rmsnorm_module(N, "bf16", weight_dtype_str="f32")
+        args = (x, residual, weight, out, torch.empty_like(x), M, stream)
+        source = (x.to(DTYPE_FP32) + residual.to(DTYPE_FP32)).to(DTYPE_BF16)
+    else:
+        launch = rmsnorm_kernel_impl.build_rmsnorm_module(N, "bf16", weight_dtype_str="f32")
+        args = (x, weight, out, M, stream)
+        source = x
+    flyc.compile(launch, *args)(*args)
+    torch.cuda.synchronize()
+    _assert_bf16_nan_output(out, source, weight)
 
 
 @pytest.mark.multi_gpu
