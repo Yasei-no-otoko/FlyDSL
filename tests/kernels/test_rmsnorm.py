@@ -32,6 +32,7 @@ import flydsl.compiler as flyc  # noqa: E402
 import kernels.norm.rmsnorm_kernel as rmsnorm_kernel_impl  # noqa: E402
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from kernels.common.tensor_shim import _run_compiled  # noqa: E402
+from kernels.norm.rmsnorm_common import has_hw_cvt_pk_bf16_f32  # noqa: E402
 from kernels.norm.rmsnorm_kernel import (  # noqa: E402
     build_fused_add_rmsnorm_bwd_module,
     build_fused_add_rmsnorm_bwd_two_stage_module,
@@ -140,6 +141,9 @@ def _get_rmsnorm_configs():
         (64, 2000, "f32"),  # unaligned tail handling
         (16, 512, "bf16"),  # bf16 small shape
         (64, 8192, "bf16"),  # bf16 fast-path N with small M
+        (64, 7168, "bf16"),  # 128-bit path with a partial last tile (DeepSeek-V3 / Kimi hidden size)
+        (64, 2880, "bf16"),  # 128-bit path with a partial last tile (gpt-oss hidden size)
+        (64, 1000, "bf16"),  # small-N 128-bit path with a partial last pass
     ]
 
 
@@ -1786,6 +1790,44 @@ def test_rmsnorm_vec8_contiguous_storage_offset(weight_dtype):
         atol=2e-1,
     )
     torch.testing.assert_close(dweight.to(DTYPE_FP32), dweight_ref, rtol=1e-1, atol=1.0)
+
+
+@pytest.mark.skipif(
+    not has_hw_cvt_pk_bf16_f32(GPU_ARCH),
+    reason="the integer bf16 rounding used without v_cvt_pk_bf16_f32 does not keep NaN payloads",
+)
+@pytest.mark.parametrize(
+    "N, fused_add",
+    [(1536, False), (2880, False), (7168, False), (8192, False), (2880, True), (7168, True), (8192, True)],
+)
+def test_rmsnorm_bf16_output_keeps_nan(N, fused_add):
+    """NaN payloads in FP32 weights stay NaN in the BF16 output of the 128-bit paths."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    M = 4
+    torch.manual_seed(0)
+    x = torch.randn((M, N), device=device, dtype=DTYPE_BF16)
+    residual = torch.randn((M, N), device=device, dtype=DTYPE_BF16)
+    weight = torch.rand((N,), device=device, dtype=DTYPE_FP32) + 0.5
+    nan_cols = [17, 118, 219]
+    # Payloads at or above 0x7FFF8000 (0xFFFFFFFF, 0x7FFFFFFF) round to +-0 under the integer rounding;
+    # 0x7FC00000 is the canonical NaN.
+    for col, bits in zip(nan_cols, (-1, 0x7FFFFFFF, 0x7FC00000)):
+        weight.view(torch.int32)[col] = bits
+
+    if fused_add:
+        out, _ = fused_add_rmsnorm(x, residual, weight, prenorm=True)
+        source = (x.to(DTYPE_FP32) + residual.to(DTYPE_FP32)).to(DTYPE_BF16)
+    else:
+        out = rmsnorm(x, weight)
+        source = x
+
+    assert torch.isnan(out[:, nan_cols].to(DTYPE_FP32)).all()
+    finite_weight = weight.clone()
+    finite_weight[nan_cols] = 1.0
+    keep = torch.ones(N, dtype=torch.bool, device=device)
+    keep[nan_cols] = False
+    ref = _reference_rmsnorm(source, finite_weight)
+    torch.testing.assert_close(out[:, keep].to(DTYPE_FP32), ref[:, keep], rtol=2e-2, atol=2e-2)
 
 
 @pytest.mark.multi_gpu

@@ -97,6 +97,16 @@ def to_elem_scalar(dtype_str: str, elem_dtype, y):
     return y.to(elem_dtype)
 
 
+def has_hw_cvt_pk_bf16_f32(arch) -> bool:
+    """Whether to_elem_vec can use v_cvt_pk_bf16_f32 on `arch`.
+
+    The instruction rounds to nearest even and keeps NaNs. The integer rounding that to_elem_vec falls back to turns
+    NaN payloads >= 0x7FFF8000 into +-0.
+    """
+    arch = str(arch)
+    return arch.startswith("gfx95") or arch == "gfx1250"
+
+
 def to_elem_vec(dtype_str: str, elem_dtype, use_hw_cvt_bf16: bool, y):
     if const_expr(dtype_str == "bf16"):
         if const_expr(use_hw_cvt_bf16):
