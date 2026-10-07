@@ -97,7 +97,7 @@ def to_elem_scalar(dtype_str: str, elem_dtype, y):
     return y.to(elem_dtype)
 
 
-def has_hw_cvt_pk_bf16_f32(arch) -> bool:
+def has_hw_cvt_pk_bf16_f32(arch: str) -> bool:
     """Whether to_elem_vec can use v_cvt_pk_bf16_f32 on `arch`.
 
     The instruction rounds to nearest even and keeps NaNs. The integer rounding that to_elem_vec falls back to turns
@@ -112,7 +112,7 @@ def to_elem_vec_keeps_nan(dtype_str: str, use_hw_cvt_bf16: bool) -> bool:
 
     Only the BF16 integer rounding (no v_cvt_pk_bf16_f32) loses NaNs, which the scalar paths keep. The builders take
     the 128-bit path for partial tiles and small N only where this holds; elsewhere BF16 outputs use it for whole
-    tiles only, as before.
+    tiles only.
     """
     return dtype_str != "bf16" or use_hw_cvt_bf16
 

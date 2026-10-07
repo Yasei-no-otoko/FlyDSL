@@ -5,10 +5,12 @@
 
 RMSNorm(x) = x / sqrt(mean(x^2) + eps) * gamma
 
-Two paths:
-  - Fast path (16-bit dtypes, N >= tile_cols, N % 8 == 0): 128-bit buffer copies, with the partial last tile masked.
-    BF16 outputs on targets without v_cvt_pk_bf16_f32 take it for whole tiles only (N % tile_cols == 0).
-  - Generic path (other N): scalar guarded copies.
+Paths:
+  - N <= 2048: several rows per workgroup; 128-bit copies for 16-bit dtypes with N % 8 == 0, else scalar copies.
+  - N > 2048, fast path (16-bit dtypes, N >= tile_cols, N % 8 == 0): 128-bit buffer copies, with the partial last tile
+    masked.
+  - N > 2048, generic path (other N): scalar guarded copies.
+On targets without v_cvt_pk_bf16_f32, BF16 outputs take the 128-bit copies for whole tiles only (N % tile_cols == 0).
 """
 
 import math
@@ -194,7 +196,7 @@ def build_rmsnorm_module(
             g_local = []
 
             # Pass 1: load + cache + sumsq. Gamma is loaded here too: the compiler cannot move a load above a store to
-            # a possibly aliasing buffer, so loading gamma in pass 2 exposed one full memory latency per tile.
+            # a buffer that may alias, so a gamma load in pass 2 would wait one full memory latency per tile.
             for tile_i in range_constexpr(num_tiles):
                 idx = tid + tile_i * BLOCK_THREADS
                 if const_expr((tile_i + 1) * tile_cols > N):
@@ -377,7 +379,7 @@ def _build_rmsnorm_large_m_small_n_module(
     USE_HW_CVT_PK_BF16_F32 = _has_hw_cvt_pk_bf16_f32(arch)
     # 128-bit path: each lane keeps its 8-element vectors of the row (and the matching gamma vectors) in registers,
     # so the second pass issues no global loads. The scalar loop re-reads x and gamma after every store, which
-    # serializes one memory round trip per element (N = 1536: ~13 us per row regardless of M).
+    # serializes one memory round trip per element.
     VEC_PATH = N % VEC_WIDTH == 0 and elem_bits <= 16 and _to_elem_vec_keeps_nan(dtype_str, USE_HW_CVT_PK_BF16_F32)
     n_vecs = N // VEC_WIDTH
 
@@ -667,8 +669,8 @@ def build_fused_add_rmsnorm_module(
             g_local = []
 
             # Issue every global load (x, residual, gamma) before the first residual_out store: the compiler cannot
-            # move a load above a store to a possibly aliasing buffer, so interleaving them exposed one full memory
-            # latency per tile in each pass.
+            # move a load above a store to a buffer that may alias, so an interleaved load would wait one full memory
+            # latency per tile.
             for tile_i in range_constexpr(num_tiles):
                 idx = tid + tile_i * BLOCK_THREADS
                 if const_expr((tile_i + 1) * tile_cols > N):
